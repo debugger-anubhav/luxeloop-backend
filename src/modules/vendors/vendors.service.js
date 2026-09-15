@@ -21,9 +21,68 @@ async function registerVendor(userId, data) {
 }
 
 async function getMyVendorProfile(vendorId) {
-  const { rows } = await query('SELECT * FROM vendors WHERE id = $1', [vendorId]);
+  const { rows } = await query(
+    `SELECT v.*,
+            row_to_json(a) AS pickup_address
+     FROM vendors v
+     LEFT JOIN addresses a ON a.id = v.pickup_address_id
+     WHERE v.id = $1`,
+    [vendorId]
+  );
   if (!rows[0]) throw ApiError.notFound('Vendor not found');
   return rows[0];
+}
+
+async function setPickupAddress(vendorId, data) {
+  const { label, full_name, phone, line1, line2, landmark, city, state, pincode, country, lat, lng, full_address } = data;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      'SELECT user_id, pickup_address_id FROM vendors WHERE id = $1',
+      [vendorId]
+    );
+    const vendorUserId = existing.rows[0]?.user_id;
+    const existingAddressId = existing.rows[0]?.pickup_address_id;
+
+    let addressId;
+    if (existingAddressId) {
+      const { rows } = await client.query(
+        `UPDATE addresses
+         SET label=$1, full_name=$2, phone=$3, line1=$4, line2=$5, landmark=$6,
+             city=$7, state=$8, pincode=$9, country=$10, lat=$11, lng=$12, full_address=$13
+         WHERE id=$14 RETURNING id`,
+        [label || 'pickup', full_name, phone, line1, line2 || null, landmark || null,
+         city, state, pincode, country, lat || null, lng || null, full_address || null, existingAddressId]
+      );
+      addressId = rows[0].id;
+    } else {
+      const { rows } = await client.query(
+        `INSERT INTO addresses (user_id, label, full_name, phone, line1, line2, landmark, city, state, pincode, country, lat, lng, full_address, is_default)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,TRUE) RETURNING id`,
+        [vendorUserId, label || 'pickup', full_name, phone, line1, line2 || null, landmark || null,
+         city, state, pincode, country, lat || null, lng || null, full_address || null]
+      );
+      addressId = rows[0].id;
+    }
+
+    await client.query('UPDATE vendors SET pickup_address_id=$1 WHERE id=$2', [addressId, vendorId]);
+    await client.query('COMMIT');
+
+    const { rows } = await client.query(
+      `SELECT v.*, row_to_json(a) AS pickup_address
+       FROM vendors v LEFT JOIN addresses a ON a.id = v.pickup_address_id
+       WHERE v.id = $1`,
+      [vendorId]
+    );
+    return rows[0];
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 async function updateVendorProfile(vendorId, data) {
@@ -147,9 +206,12 @@ async function addBankAccount(vendorId, data) {
 
 async function getPublicVendorProfile(vendorId) {
   const { rows } = await query(
-    `SELECT id, shop_name, slug, description, logo_url, banner_url,
-            rating_avg, rating_count, is_verified, created_at
-     FROM vendors WHERE id = $1 AND status = 'active'`,
+    `SELECT v.id, v.shop_name, v.slug, v.description, v.logo_url, v.banner_url,
+            v.rating_avg, v.rating_count, v.is_verified, v.created_at,
+            row_to_json(a) AS pickup_address
+     FROM vendors v
+     LEFT JOIN addresses a ON a.id = v.pickup_address_id
+     WHERE v.id = $1 AND v.status = 'active'`,
     [vendorId]
   );
   if (!rows[0]) throw ApiError.notFound('Vendor not found');
@@ -158,6 +220,7 @@ async function getPublicVendorProfile(vendorId) {
 
 module.exports = {
   registerVendor, getMyVendorProfile, updateVendorProfile,
+  setPickupAddress,
   getVendorOrders, getVendorRentals, getVendorAnalytics,
   addBankAccount, getPublicVendorProfile,
 };

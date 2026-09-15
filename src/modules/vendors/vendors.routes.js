@@ -10,6 +10,7 @@ const router = Router();
 router.post('/register',          authenticate, validate(registerVendorSchema), controller.registerVendor);
 router.get('/me',                 authenticate, requireVendor,                  controller.getMyVendorProfile);
 router.patch('/me',               authenticate, requireVendor,                  controller.updateVendorProfile);
+router.put('/me/pickup-address',  authenticate, requireVendor,                  controller.setPickupAddress);
 router.get('/me/orders',          authenticate, requireVendor,                  controller.getVendorOrders);
 router.get('/me/rentals',         authenticate, requireVendor,                  controller.getVendorRentals);
 router.get('/me/analytics',       authenticate, requireVendor,                  controller.getVendorAnalytics);

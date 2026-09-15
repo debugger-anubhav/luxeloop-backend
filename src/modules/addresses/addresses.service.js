@@ -10,7 +10,7 @@ async function getMyAddresses(userId) {
 }
 
 async function createAddress(userId, data) {
-  const { label, full_name, phone, line1, line2, landmark, city, state, pincode, country } = data;
+  const { label, full_name, phone, line1, line2, landmark, city, state, pincode, country, address_type, lat, lng, full_address } = data;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -18,9 +18,9 @@ async function createAddress(userId, data) {
     const isDefault = existing.rows.length === 0;
 
     const { rows } = await client.query(
-      `INSERT INTO addresses (user_id, label, full_name, phone, line1, line2, landmark, city, state, pincode, country, is_default)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [userId, label, full_name, phone, line1, line2 || null, landmark || null, city, state, pincode, country, isDefault]
+      `INSERT INTO addresses (user_id, label, full_name, phone, line1, line2, landmark, city, state, pincode, country, address_type, lat, lng, full_address, is_default)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+      [userId, label, full_name, phone, line1, line2 || null, landmark || null, city, state, pincode, country, address_type || 'home', lat || null, lng || null, full_address || null, isDefault]
     );
     await client.query('COMMIT');
     return rows[0];
@@ -39,7 +39,7 @@ async function updateAddress(userId, addressId, data) {
   );
   if (!exists[0]) throw ApiError.notFound('Address not found');
 
-  const allowed = ['label','full_name','phone','line1','line2','landmark','city','state','pincode','country'];
+  const allowed = ['label','full_name','phone','line1','line2','landmark','city','state','pincode','country','address_type','lat','lng','full_address'];
   const fields = [];
   const values = [];
   let idx = 1;

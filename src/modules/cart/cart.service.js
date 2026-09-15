@@ -4,11 +4,16 @@ const ApiError = require('../../utils/ApiError');
 async function getCart(userId) {
   const { rows } = await query(
     `SELECT ci.*, pv.size, pv.color, pv.rent_price_per_day, pv.sale_price,
-            p.name AS product_name, p.slug AS product_slug,
+            p.id AS product_id, p.name AS product_name, p.slug AS product_slug, p.deposit_amount, p.dry_cleaning_fee,
+            p.vendor_id,
+            v.shop_name AS vendor_name, v.pickup_address_id AS vendor_pickup_address_id,
+            row_to_json(a) AS vendor_pickup_address,
             (SELECT url FROM product_images pi WHERE pi.product_id = p.id AND pi.is_primary LIMIT 1) AS product_image
      FROM cart_items ci
      JOIN product_variants pv ON pv.id = ci.variant_id
      JOIN products p ON p.id = pv.product_id
+     JOIN vendors v ON v.id = p.vendor_id
+     LEFT JOIN addresses a ON a.id = v.pickup_address_id
      WHERE ci.user_id = $1
      ORDER BY ci.created_at ASC`,
     [userId]
