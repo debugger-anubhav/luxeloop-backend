@@ -23,6 +23,7 @@ const wishlistsRoutes    = require('./modules/wishlists/wishlists.routes');
 const couponsRoutes      = require('./modules/coupons/coupons.routes');
 const addressesRoutes    = require('./modules/addresses/addresses.routes');
 const notificationsRoutes = require('./modules/notifications/notifications.routes');
+const homepageRoutes      = require('./modules/homepage/homepage.routes');
 
 const app = express();
 
@@ -54,6 +55,7 @@ app.use('/api/v1/wishlist',      wishlistsRoutes);
 app.use('/api/v1/coupons',       couponsRoutes);
 app.use('/api/v1/addresses',     addressesRoutes);
 app.use('/api/v1/notifications', notificationsRoutes);
+app.use('/api/v1/homepage',      homepageRoutes);
 
 app.use(errorHandler);
 
