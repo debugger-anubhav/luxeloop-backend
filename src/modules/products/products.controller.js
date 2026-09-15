@@ -38,4 +38,21 @@ const deleteProductImage = asyncHandler(async (req, res) => {
   res.success(null, 'Image deleted');
 });
 
-module.exports = { browseProducts, searchProducts, getProductDetail, createProduct, updateProduct, deleteProduct, uploadProductImages, deleteProductImage };
+const getVariantAvailability = asyncHandler(async (req, res) => {
+  const { variant_id } = req.query;
+  if (!variant_id) {
+    return res.status(400).json({ success: false, message: 'variant_id is required' });
+  }
+  res.success(await service.getVariantAvailability(variant_id), 'Availability fetched');
+});
+
+const getRecommendations = asyncHandler(async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit ?? '15', 10), 15);
+  res.success(await service.getRecommendations(req.params.slug, limit), 'Recommendations fetched');
+});
+
+const getPLPFacets = asyncHandler(async (req, res) => {
+  res.success(await service.getPLPFacets(req.query), 'Facets fetched');
+});
+
+module.exports = { browseProducts, searchProducts, getProductDetail, getVariantAvailability, getRecommendations, getPLPFacets, createProduct, updateProduct, deleteProduct, uploadProductImages, deleteProductImage };

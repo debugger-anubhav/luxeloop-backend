@@ -2,8 +2,8 @@ const asyncHandler = require('../../utils/asyncHandler');
 const authService = require('./auth.service');
 
 const register = asyncHandler(async (req, res) => {
-  const user = await authService.register(req.body);
-  res.success(user, 'Registration successful', 201);
+  const result = await authService.register(req.body);
+  res.success(result, 'Registration successful', 201);
 });
 
 const login = asyncHandler(async (req, res) => {
@@ -39,4 +39,20 @@ const verifyEmail = asyncHandler(async (req, res) => {
   res.success(null, 'Email verified successfully');
 });
 
-module.exports = { register, login, logout, refreshToken, forgotPassword, resetPassword, verifyEmail };
+const sendAuthOtp = asyncHandler(async (req, res) => {
+  const result = await authService.sendAuthOtp(req.body);
+  res.success(result, 'OTP sent successfully');
+});
+
+const verifyAuthOtp = asyncHandler(async (req, res) => {
+  const { identifier, code, purpose, name } = req.body;
+  const result = await authService.verifyAuthOtp({
+    identifier,
+    code,
+    purpose,
+    userData: { name },
+  });
+  res.success(result, result.isNewUser ? 'Registration successful' : 'Login successful');
+});
+
+module.exports = { register, login, logout, refreshToken, forgotPassword, resetPassword, verifyEmail, sendAuthOtp, verifyAuthOtp };
