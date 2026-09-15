@@ -1,0 +1,2 @@
+ALTER TABLE products
+  ADD COLUMN IF NOT EXISTS dry_cleaning_fee NUMERIC(10,2) DEFAULT NULL;

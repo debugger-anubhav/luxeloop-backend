@@ -1,4 +1,4 @@
--- Vastra initial schema
+-- LuxeLoop initial schema
 
 -- Enums
 CREATE TYPE user_role         AS ENUM ('customer', 'vendor', 'admin');
@@ -381,7 +381,7 @@ CREATE SEQUENCE order_seq START 1000;
 CREATE OR REPLACE FUNCTION generate_order_number()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    NEW.order_number := 'VST-' || TO_CHAR(NOW(), 'YYYY') || '-' || LPAD(nextval('order_seq')::TEXT, 6, '0');
+    NEW.order_number := 'LXL-' || TO_CHAR(NOW(), 'YYYY') || '-' || LPAD(nextval('order_seq')::TEXT, 6, '0');
     RETURN NEW;
 END; $$;
 
