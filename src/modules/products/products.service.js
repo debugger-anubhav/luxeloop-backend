@@ -8,23 +8,45 @@ function buildBrowseQuery(filters, forCount = false) {
   const params = [];
   let idx = 1;
 
+  // Recursive category match — includes all descendant sub-categories
   if (filters.category) {
-    conditions.push(`c.slug = $${idx++}`);
+    conditions.push(`
+      c.id IN (
+        WITH RECURSIVE cat_tree AS (
+          SELECT id FROM categories WHERE slug = $${idx++}
+          UNION ALL
+          SELECT ch.id FROM categories ch JOIN cat_tree ct ON ch.parent_id = ct.id
+        )
+        SELECT id FROM cat_tree
+      )
+    `);
     params.push(filters.category);
   }
+
   if (filters.listing_type) {
-    conditions.push(`p.listing_type = $${idx++}`);
-    params.push(filters.listing_type);
+    // 'both' products are rentable AND purchasable — include them when filtering by rent or sale
+    if (filters.listing_type === 'both') {
+      conditions.push(`p.listing_type = 'both'`);
+    } else {
+      conditions.push(`p.listing_type IN ($${idx++}, 'both')`);
+      params.push(filters.listing_type);
+    }
   }
   if (filters.min_price) {
-    conditions.push(`(pv.rent_price_per_day >= $${idx} OR pv.sale_price >= $${idx})`);
-    params.push(filters.min_price);
-    idx++;
+    const minP = parseFloat(filters.min_price);
+    if (!isNaN(minP)) {
+      conditions.push(`(pv.rent_price_per_day >= $${idx} OR pv.sale_price >= $${idx})`);
+      params.push(minP);
+      idx++;
+    }
   }
   if (filters.max_price) {
-    conditions.push(`(pv.rent_price_per_day <= $${idx} OR pv.sale_price <= $${idx})`);
-    params.push(filters.max_price);
-    idx++;
+    const maxP = parseFloat(filters.max_price);
+    if (!isNaN(maxP)) {
+      conditions.push(`(pv.rent_price_per_day <= $${idx} OR pv.sale_price <= $${idx})`);
+      params.push(maxP);
+      idx++;
+    }
   }
   if (filters.size) {
     conditions.push(`pv.size = $${idx++}`);
@@ -43,12 +65,28 @@ function buildBrowseQuery(filters, forCount = false) {
     params.push(`%${filters.brand}%`);
   }
 
+  // Curated section filters
+  if (filters.section === 'trending')       conditions.push('p.is_trending = TRUE');
+  if (filters.section === 'featured')       conditions.push('p.is_featured = TRUE');
+  if (filters.section === 'designer_picks') conditions.push('p.is_designer_pick = TRUE');
+  if (filters.section === 'new_arrivals')   conditions.push("p.created_at >= NOW() - INTERVAL '30 days'");
+
   return { conditions, params };
 }
 
 async function browseProducts(queryParams) {
   const { page, limit, offset } = parsePaginationParams(queryParams);
   const { conditions, params } = buildBrowseQuery(queryParams);
+
+  // Fetch category meta (name + description) when filtering by category slug
+  let categoryMeta = null;
+  if (queryParams.category) {
+    const { rows: catRows } = await query(
+      'SELECT name, description FROM categories WHERE slug = $1',
+      [queryParams.category]
+    );
+    if (catRows[0]) categoryMeta = catRows[0];
+  }
 
   const countSql = `
     SELECT COUNT(DISTINCT p.id) FROM products p
@@ -61,15 +99,17 @@ async function browseProducts(queryParams) {
   const total = parseInt(countRows[0].count, 10);
 
   let orderClause = 'p.created_at DESC';
-  if (queryParams.sort === 'price_asc')  orderClause = 'MIN(pv.sale_price) ASC NULLS LAST';
-  if (queryParams.sort === 'price_desc') orderClause = 'MIN(pv.sale_price) DESC NULLS LAST';
-  if (queryParams.sort === 'rating')     orderClause = 'p.rating_avg DESC';
+  if (queryParams.sort === 'price_asc')  orderClause = 'MIN(pv.rent_price_per_day) ASC NULLS LAST';
+  if (queryParams.sort === 'price_desc') orderClause = 'MIN(pv.rent_price_per_day) DESC NULLS LAST';
+  if (queryParams.sort === 'rating')     orderClause = 'p.rating_avg DESC NULLS LAST';
   if (queryParams.sort === 'newest')     orderClause = 'p.created_at DESC';
+  if (queryParams.sort === 'discount')   orderClause = 'p.discount_percent DESC NULLS LAST, p.created_at DESC';
 
   const listParams = [...params, limit, offset];
   const listSql = `
     SELECT p.id, p.name, p.slug, p.listing_type, p.deposit_amount,
            p.rating_avg, p.review_count, p.tags,
+           p.is_featured, p.is_trending, p.is_designer_pick,
            c.name AS category_name, c.slug AS category_slug,
            v.shop_name AS vendor_name, v.slug AS vendor_slug,
            MIN(pv.rent_price_per_day) AS min_rent_price,
@@ -85,7 +125,13 @@ async function browseProducts(queryParams) {
     LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
 
   const { rows } = await query(listSql, listParams);
-  return { products: rows, pagination: buildPaginationMeta(total, page, limit) };
+  return {
+    products: rows,
+    pagination: {
+      ...buildPaginationMeta(total, page, limit),
+      ...(categoryMeta ? { category_description: categoryMeta.description } : {}),
+    },
+  };
 }
 
 async function searchProducts(queryParams) {
@@ -112,6 +158,7 @@ async function searchProducts(queryParams) {
   const listSql = `
     SELECT p.id, p.name, p.slug, p.listing_type, p.deposit_amount,
            p.rating_avg, p.review_count, p.tags,
+           p.is_featured, p.is_trending, p.is_designer_pick,
            c.name AS category_name, c.slug AS category_slug,
            v.shop_name AS vendor_name, v.slug AS vendor_slug,
            MIN(pv.rent_price_per_day) AS min_rent_price,
@@ -153,8 +200,162 @@ async function getProductDetail(slug) {
   return { ...product, variants: variants.rows, images: images.rows };
 }
 
+/**
+ * Algorithmic recommendations for "Complete the Look".
+ *
+ * Scoring (higher = more relevant):
+ *   +4  same category
+ *   +2  per overlapping tag (capped at 3 tags → max +6)
+ *   +3  same brand (when brand is set)
+ *   +2  similar price range (min_rent within ±50% of source product's min_rent)
+ *   tie-break: rating_avg DESC
+ */
+async function getRecommendations(slug, limit = 15) {
+  const { rows: base } = await query(
+    `SELECT p.id, p.category_id, p.brand, p.tags,
+            MIN(pv.rent_price_per_day) AS min_rent
+     FROM products p
+     JOIN product_variants pv ON pv.product_id = p.id AND pv.is_active
+     WHERE p.slug = $1 AND p.is_active = TRUE
+     GROUP BY p.id`,
+    [slug]
+  );
+  if (!base[0]) throw ApiError.notFound('Product not found');
+
+  const { id: productId, category_id, brand, tags, min_rent } = base[0];
+  const rentPrice = min_rent ? parseFloat(min_rent) : null;
+
+  const { rows } = await query(
+    `SELECT
+       p.id, p.name, p.slug, p.listing_type, p.rating_avg, p.brand, p.tags,
+       c.name  AS category_name,
+       c.slug  AS category_slug,
+       MIN(pv.rent_price_per_day) AS min_rent_price,
+       MIN(pv.sale_price)         AS min_sale_price,
+       (SELECT url FROM product_images pi2
+        WHERE pi2.product_id = p.id AND pi2.is_primary LIMIT 1) AS primary_image,
+
+       -- scoring expression
+       (
+         CASE WHEN p.category_id = $2 THEN 4 ELSE 0 END
+         + LEAST(
+             COALESCE(array_length(
+               ARRAY(SELECT unnest(p.tags) INTERSECT SELECT unnest($3::text[])),
+             1), 0) * 2,
+             6
+           )
+         + CASE WHEN $4::text IS NOT NULL AND p.brand = $4::text THEN 3 ELSE 0 END
+         + CASE WHEN $5::numeric IS NOT NULL
+                 AND MIN(pv.rent_price_per_day) IS NOT NULL
+                 AND MIN(pv.rent_price_per_day) BETWEEN $5::numeric * 0.5 AND $5::numeric * 1.5
+                THEN 2 ELSE 0 END
+       ) AS score
+
+     FROM products p
+     JOIN categories c  ON c.id  = p.category_id
+     JOIN vendors v     ON v.id  = p.vendor_id
+     JOIN product_variants pv ON pv.product_id = p.id AND pv.is_active
+     WHERE p.is_active = TRUE
+       AND v.status = 'active'
+       AND p.id != $1
+     GROUP BY p.id, c.name, c.slug
+     HAVING (
+       p.category_id = $2
+       OR COALESCE(array_length(
+            ARRAY(SELECT unnest(p.tags) INTERSECT SELECT unnest($3::text[])),
+          1), 0) > 0
+       OR ($4::text IS NOT NULL AND p.brand = $4::text)
+     )
+     ORDER BY score DESC, p.rating_avg DESC NULLS LAST
+     LIMIT $6`,
+    [productId, category_id, tags ?? [], brand ?? null, rentPrice, limit]
+  );
+
+  return rows;
+}
+
+/**
+ * Returns aggregated facets for PLP filter UI.
+ * Runs the same WHERE clause as browseProducts but aggregates instead of paginating.
+ * Brand is intentionally excluded (vendors are small retailers, not major brands).
+ */
+async function getPLPFacets(queryParams) {
+  const { conditions, params } = buildBrowseQuery(queryParams);
+
+  const facetSql = `
+    SELECT
+      -- categories present in result set
+      json_agg(DISTINCT jsonb_build_object('slug', c.slug, 'name', c.name))
+        FILTER (WHERE c.slug IS NOT NULL)                         AS categories,
+
+      -- price range (rent or sale, whichever is lower per product)
+      MIN(LEAST(pv.rent_price_per_day, pv.sale_price))::float    AS price_min,
+      MAX(GREATEST(pv.rent_price_per_day, pv.sale_price))::float AS price_max,
+
+      -- distinct non-null colors
+      array_agg(DISTINCT pv.color) FILTER (WHERE pv.color IS NOT NULL) AS colors,
+
+      -- distinct non-null sizes
+      array_agg(DISTINCT pv.size)  FILTER (WHERE pv.size  IS NOT NULL) AS sizes,
+
+      -- which listing_types appear
+      array_agg(DISTINCT p.listing_type)                               AS listing_types,
+
+      -- flattened unique tags (unnest then reaggregate)
+      array_agg(DISTINCT tag) FILTER (WHERE tag IS NOT NULL)           AS tags,
+
+      -- max rating_avg floored to whole numbers (for 3+, 4+ buckets)
+      MAX(p.rating_avg)::float                                         AS rating_max
+
+    FROM products p
+    JOIN categories c    ON c.id  = p.category_id
+    JOIN vendors v       ON v.id  = p.vendor_id
+    JOIN product_variants pv ON pv.product_id = p.id AND pv.is_active
+    -- unnest tags so we can DISTINCT them
+    LEFT JOIN LATERAL unnest(p.tags) AS tag ON TRUE
+    WHERE p.is_active AND v.status = 'active'
+      AND ${conditions.join(' AND ')}`;
+
+  const { rows } = await query(facetSql, params);
+  const row = rows[0] ?? {};
+
+  // Build rating threshold options (e.g. 3+, 4+) based on data
+  const ratingMax = row.rating_max ? Math.floor(row.rating_max) : null;
+  const ratingThresholds = ratingMax
+    ? Array.from({ length: Math.max(0, ratingMax - 2) }, (_, i) => i + 3)
+    : [];
+
+  // pg returns array columns as JS arrays already, but listing_types uses
+  // array_agg which can come back as a pg text-array string on some drivers —
+  // normalise it just in case.
+  const normaliseArray = (v) => {
+    if (!v) return [];
+    if (Array.isArray(v)) return v;
+    // e.g. "{rent,both}" → ["rent","both"]
+    return String(v).replace(/^\{|\}$/g, '').split(',').filter(Boolean);
+  };
+
+  return {
+    categories:    row.categories    ?? [],
+    price_range:   { min: row.price_min ?? 0, max: row.price_max ?? 0 },
+    colors:        normaliseArray(row.colors).sort(),
+    sizes:         normaliseArray(row.sizes),
+    listing_types: normaliseArray(row.listing_types),
+    tags:          normaliseArray(row.tags).sort(),
+    rating_thresholds: ratingThresholds,
+  };
+}
+
 async function createProduct(vendorId, data) {
   const { variants, ...productData } = data;
+
+  // Ensure exactly one default: if caller didn't mark any, promote the first.
+  const hasDefault = variants.some((v) => v.is_default);
+  const normalisedVariants = variants.map((v, i) => ({
+    ...v,
+    is_default: hasDefault ? !!v.is_default : i === 0,
+  }));
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -178,15 +379,15 @@ async function createProduct(vendorId, data) {
     const product = pRows[0];
 
     const insertedVariants = [];
-    for (const v of variants) {
+    for (const v of normalisedVariants) {
       const { rows: vRows } = await client.query(
         `INSERT INTO product_variants (product_id, size, color, color_hex, sku, rent_price_per_day,
-          sale_price, stock_qty, available_qty, weight_grams)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9) RETURNING *`,
+          sale_price, stock_qty, available_qty, weight_grams, is_default)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10) RETURNING *`,
         [
           product.id, v.size || null, v.color || null, v.color_hex || null,
           v.sku || null, v.rent_price_per_day || null, v.sale_price || null,
-          v.stock_qty, v.weight_grams || null,
+          v.stock_qty, v.weight_grams || null, v.is_default,
         ]
       );
       insertedVariants.push(vRows[0]);
@@ -202,6 +403,46 @@ async function createProduct(vendorId, data) {
   }
 }
 
+async function getVariantAvailability(variantId) {
+  const { rows } = await query(
+    `SELECT oi.rental_start, oi.rental_end
+     FROM order_items oi
+     JOIN orders o ON o.id = oi.order_id
+     WHERE oi.variant_id = $1
+       AND oi.rental_start IS NOT NULL
+       AND oi.rental_end   IS NOT NULL
+       AND oi.rental_end   >= CURRENT_DATE
+       AND o.status IN ('confirmed','processing','shipped','out_for_delivery','delivered')
+     ORDER BY oi.rental_start ASC`,
+    [variantId]
+  );
+
+  const bookedRanges = rows.map((r) => ({
+    start: r.rental_start.toISOString().slice(0, 10),
+    end:   r.rental_end.toISOString().slice(0, 10),
+  }));
+
+  // Walk forward from today past any contiguous/overlapping booked blocks
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  let candidate = new Date(today);
+
+  for (const range of bookedRanges) {
+    const rangeStart = new Date(range.start);
+    const rangeEnd   = new Date(range.end);
+    if (candidate >= rangeStart && candidate <= rangeEnd) {
+      candidate = new Date(rangeEnd);
+      candidate.setDate(candidate.getDate() + 1);
+    }
+  }
+
+  return {
+    variantId,
+    bookedRanges,
+    firstAvailableDate: candidate.toISOString().slice(0, 10),
+  };
+}
+
 async function updateProduct(vendorId, productId, data) {
   const { rows: exists } = await query(
     'SELECT id FROM products WHERE id = $1 AND vendor_id = $2',
@@ -209,7 +450,11 @@ async function updateProduct(vendorId, productId, data) {
   );
   if (!exists[0]) throw ApiError.notFound('Product not found');
 
-  const allowed = ['name','description','listing_type','deposit_amount','brand','fabric','care_instructions','tags','is_active','category_id'];
+  const allowed = [
+    'name', 'description', 'listing_type', 'deposit_amount', 'dry_cleaning_fee', 'brand',
+    'fabric', 'care_instructions', 'tags', 'is_active', 'category_id',
+    'is_featured', 'is_trending', 'is_designer_pick',
+  ];
   const fields = [];
   const values = [];
   let idx = 1;
@@ -280,7 +525,8 @@ async function deleteProductImage(vendorId, productId, imageId) {
 }
 
 module.exports = {
-  browseProducts, searchProducts, getProductDetail,
+  browseProducts, searchProducts, getProductDetail, getVariantAvailability,
+  getRecommendations, getPLPFacets,
   createProduct, updateProduct, deleteProduct,
   uploadProductImages, deleteProductImage,
 };

@@ -9,6 +9,7 @@ const variantSchema = z.object({
   sale_price:         z.number().min(0).optional(),
   stock_qty:          z.number().int().min(0).default(0),
   weight_grams:       z.number().int().optional(),
+  is_default:         z.boolean().default(false),
 });
 
 const createProductSchema = z.object({
@@ -22,6 +23,20 @@ const createProductSchema = z.object({
   care_instructions: z.string().optional(),
   tags:              z.array(z.string()).default([]),
   variants:          z.array(variantSchema).min(1),
+}).superRefine((data, ctx) => {
+  const defaultCount = data.variants.filter((v) => v.is_default).length;
+  if (defaultCount === 0) {
+    // Auto-promote the first variant rather than rejecting — handled in service,
+    // but flag here so callers know when they haven't set one explicitly.
+    return;
+  }
+  if (defaultCount > 1) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Exactly one variant must be marked as is_default',
+      path: ['variants'],
+    });
+  }
 });
 
 module.exports = { createProductSchema };

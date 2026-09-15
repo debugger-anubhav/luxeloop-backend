@@ -8,9 +8,12 @@ const { createProductSchema } = require('./products.schema');
 
 const router = Router();
 
-router.get('/',           controller.browseProducts);
-router.get('/search',     controller.searchProducts);
-router.get('/:slug',      controller.getProductDetail);
+router.get('/',                   controller.browseProducts);
+router.get('/search',             controller.searchProducts);
+router.get('/facets',             controller.getPLPFacets);
+router.get('/:slug/availability',    controller.getVariantAvailability);
+router.get('/:slug/recommendations', controller.getRecommendations);
+router.get('/:slug',                 controller.getProductDetail);
 router.post('/',          authenticate, requireVendor, validate(createProductSchema), controller.createProduct);
 router.patch('/:id',      authenticate, requireVendor,                                controller.updateProduct);
 router.delete('/:id',     authenticate, requireVendor,                                controller.deleteProduct);

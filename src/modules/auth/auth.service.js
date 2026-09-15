@@ -6,6 +6,7 @@ const ApiError = require('../../utils/ApiError');
 const { signAccessToken, signRefreshToken, verifyToken } = require('../../utils/tokenUtils');
 const nodemailer = require('nodemailer');
 const logger = require('../../config/logger');
+const otpService = require('../otp/otp.service');
 
 const mailer = nodemailer.createTransport({
   host: env.SMTP_HOST,
@@ -21,7 +22,7 @@ async function sendMail(to, subject, text) {
   }
 }
 
-async function register({ full_name, email, phone, password }) {
+async function register({ name, email, phone, password }) {
   const existing = email
     ? await query('SELECT id FROM users WHERE email = $1', [email])
     : await query('SELECT id FROM users WHERE phone = $1', [phone]);
@@ -30,11 +31,14 @@ async function register({ full_name, email, phone, password }) {
     throw ApiError.conflict('User already exists with this email or phone');
   }
 
-  const password_hash = await bcrypt.hash(password, env.BCRYPT_ROUNDS);
+  const password_hash = password
+    ? await bcrypt.hash(password, env.BCRYPT_ROUNDS)
+    : null;
+
   const { rows } = await query(
     `INSERT INTO users (full_name, email, phone, password_hash)
      VALUES ($1, $2, $3, $4) RETURNING id, full_name, email, phone, role, created_at`,
-    [full_name, email || null, phone || null, password_hash]
+    [name, email || null, phone || null, password_hash]
   );
 
   const user = rows[0];
@@ -47,10 +51,21 @@ async function register({ full_name, email, phone, password }) {
        VALUES ($1, 'email_verify', $2, NOW() + INTERVAL '15 minutes')`,
       [user.id, code_hash]
     );
-    sendMail(email, 'Verify your Vastra account', `Your OTP is: ${otp}`);
+    sendMail(email, 'Verify your LuxeLoop account', `Your OTP is: ${otp}`);
   }
 
-  return user;
+  const payload = { id: user.id, email: user.email, role: user.role };
+  const accessToken = signAccessToken(payload);
+  const refreshToken = signRefreshToken(payload);
+
+  const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  await query(
+    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
+    [user.id, tokenHash, expiresAt]
+  );
+
+  return { user, tokens: { accessToken, refreshToken } };
 }
 
 async function login({ email, phone, password }, deviceInfo) {
@@ -80,7 +95,7 @@ async function login({ email, phone, password }, deviceInfo) {
   await query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id]);
 
   const { password_hash: _, ...safeUser } = user;
-  return { user: safeUser, accessToken, refreshToken };
+  return { user: safeUser, tokens: { accessToken, refreshToken } };
 }
 
 async function logout(refreshToken) {
@@ -173,4 +188,82 @@ async function verifyEmail({ token, code }) {
   await query('UPDATE otp_codes SET used = TRUE WHERE id = $1', [rows[0].id]);
 }
 
-module.exports = { register, login, logout, refreshAccessToken, forgotPassword, resetPassword, verifyEmail };
+// ── OTP auth flows ────────────────────────────────────────────────────────────
+
+const issueTokensForUser = async (user) => {
+  const payload = { id: user.id, email: user.email, role: user.role };
+  const accessToken = signAccessToken(payload);
+  const refreshToken = signRefreshToken(payload);
+
+  const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+  await query(
+    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
+    [user.id, tokenHash, expiresAt]
+  );
+
+  await query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id]);
+
+  return { accessToken, refreshToken };
+};
+
+/**
+ * Step 1 of OTP login/register: send OTP to identifier (phone or email).
+ * Does NOT reveal whether the user exists.
+ */
+async function sendAuthOtp({ identifier, purpose }) {
+  await otpService.sendOtp(identifier, purpose);
+  return { sent: true };
+}
+
+/**
+ * Step 2: verify OTP and either log the user in or create their account.
+ *
+ * For `login`:   user must already exist, otherwise 404.
+ * For `register`: user must NOT exist, otherwise 409.
+ *                 Additional fields (name) passed in `userData` are stored.
+ */
+async function verifyAuthOtp({ identifier, code, purpose, userData = {} }) {
+  await otpService.verifyOtp(identifier, code, purpose);
+
+  const isPhone = /^\+?[0-9]{7,15}$/.test(identifier.replace(/\s/g, ''));
+  const field = isPhone ? 'phone' : 'email';
+
+  const { rows } = await query(
+    `SELECT * FROM users WHERE ${field} = $1 AND is_active = TRUE`,
+    [identifier]
+  );
+
+  let user = rows[0];
+
+  if (purpose === 'login') {
+    if (!user) throw ApiError.notFound('No account found for this identifier. Please register first.');
+
+    const { password_hash: _, ...safeUser } = user;
+    const tokens = await issueTokensForUser(safeUser);
+    return { user: safeUser, tokens, isNewUser: false };
+  }
+
+  if (purpose === 'register') {
+    if (user) throw ApiError.conflict('An account already exists with this identifier. Please log in.');
+
+    const { name } = userData;
+    if (!name) throw ApiError.badRequest('Name is required for registration.');
+
+    const { rows: inserted } = await query(
+      `INSERT INTO users (full_name, ${field}, password_hash)
+       VALUES ($1, $2, NULL)
+       RETURNING id, full_name, email, phone, role, created_at`,
+      [name, identifier]
+    );
+
+    user = inserted[0];
+    const tokens = await issueTokensForUser(user);
+    return { user, tokens, isNewUser: true };
+  }
+
+  throw ApiError.badRequest('Invalid purpose for OTP auth flow.');
+}
+
+module.exports = { register, login, logout, refreshAccessToken, forgotPassword, resetPassword, verifyEmail, sendAuthOtp, verifyAuthOtp };
